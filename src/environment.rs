@@ -62,7 +62,8 @@ impl Environment {
 			name: "default".into(),
 			log_level: LoggingLevel::Warning,
 			execution_providers: Vec::new(),
-			global_thread_pool_options: vec![]
+			global_thread_pool_options: vec![],
+			telemetry_enabled: None
 		}
 	}
 
@@ -137,7 +138,8 @@ impl Environment {
 		log_level: LoggingLevel,
 		execution_providers: Vec<ExecutionProvider>,
 		create_env_fn: CreateEnvFunction,
-		options: HashMap<String, String>
+		options: HashMap<String, String>,
+		telemetry_enabled: Option<bool>
 	) -> OrtResult<Environment> {
 		// NOTE: Because 'G_ENV' is a lazy_static, locking it will, initially, create
 		//      a new Arc<Mutex<EnvironmentSingleton>> with a strong count of 1.
@@ -149,6 +151,18 @@ impl Environment {
 			debug!("Environment not yet initialized, creating a new one");
 			let (status, env_ptr) = create_env_fn(name.as_str(), log_level, options);
 			status_to_result(status).map_err(OrtError::CreateEnvironment)?;
+
+			if let Some(flag) = telemetry_enabled {
+				let status = if flag {
+					let enable_telemetry_events = ortsys![EnableTelemetryEvents];
+					unsafe { enable_telemetry_events(env_ptr) }
+				} else {
+					let disable_telemetry_events = ortsys![DisableTelemetryEvents];
+					unsafe { disable_telemetry_events(env_ptr) }
+				};
+
+				status_to_result(status).map_err(OrtError::CreateEnvironment).unwrap();
+			}
 
 			debug!(env_ptr = format!("{:?}", env_ptr).as_str(), "Environment created");
 
@@ -280,7 +294,8 @@ pub struct EnvBuilder {
 	name: String,
 	log_level: LoggingLevel,
 	execution_providers: Vec<ExecutionProvider>,
-	global_thread_pool_options: Vec<(String, String)>
+	global_thread_pool_options: Vec<(String, String)>,
+	telemetry_enabled: Option<bool>
 }
 
 impl EnvBuilder {
@@ -356,17 +371,30 @@ impl EnvBuilder {
 		self
 	}
 
+	pub fn with_telemetry(mut self, enabled: bool) -> EnvBuilder {
+		self.telemetry_enabled = Some(enabled);
+		self
+	}
+
 	/// Commit the configuration to a new [`Environment`].
 	pub fn build(self) -> OrtResult<Environment> {
 		if self.global_thread_pool_options.is_empty() {
-			Environment::new(self.name, self.log_level, self.execution_providers, Environment::create_custom_log_env, vec![].into_iter().collect())
+			Environment::new(
+				self.name,
+				self.log_level,
+				self.execution_providers,
+				Environment::create_custom_log_env,
+				vec![].into_iter().collect(),
+				self.telemetry_enabled
+			)
 		} else {
 			Environment::new(
 				self.name,
 				self.log_level,
 				self.execution_providers,
 				Environment::create_global_thread_pool_env,
-				self.global_thread_pool_options.into_iter().collect()
+				self.global_thread_pool_options.into_iter().collect(),
+				self.telemetry_enabled
 			)
 		}
 	}
@@ -452,7 +480,7 @@ mod tests {
 
 		let initial_name = String::from("concurrent_environment_creation");
 		let main_env =
-			Environment::new(initial_name.clone(), LoggingLevel::Warning, Vec::new(), Environment::create_custom_log_env, vec![].into_iter().collect())
+			Environment::new(initial_name.clone(), LoggingLevel::Warning, Vec::new(), Environment::create_custom_log_env, vec![].into_iter().collect(), None)
 				.unwrap();
 		let main_env_ptr = main_env.env_ptr() as usize;
 
