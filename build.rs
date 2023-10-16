@@ -444,7 +444,8 @@ fn prepare_libort_dir() -> (PathBuf, bool) {
 
 			let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 			let extract_dir = out_dir.join(ORT_EXTRACT_DIR);
-			let downloaded_file = out_dir.join(&prebuilt_archive);
+			let download_dir = PathBuf::from(env::var("ORT_LIB_DOWNLOAD_DIR").unwrap_or(env::var("OUT_DIR").unwrap()));
+			let downloaded_file = download_dir.join(&prebuilt_archive);
 
 			println!("cargo:rerun-if-changed={}", downloaded_file.display());
 
