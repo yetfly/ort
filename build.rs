@@ -9,7 +9,7 @@ use std::{
 	str::FromStr
 };
 
-const ORT_VERSION: &str = "1.14.1";
+const ORT_VERSION: &str = "1.16.0";
 const ORT_RELEASE_BASE_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download";
 const ORT_ENV_STRATEGY: &str = "ORT_STRATEGY";
 const ORT_ENV_SYSTEM_LIB_LOCATION: &str = "ORT_LIB_LOCATION";
@@ -316,6 +316,7 @@ fn add_search_dir<P: AsRef<Path>>(base: P) {
 fn system_strategy() -> (PathBuf, bool) {
 	let lib_dir = PathBuf::from(env::var(ORT_ENV_SYSTEM_LIB_LOCATION).expect("[ort] system strategy requires ORT_LIB_LOCATION env var to be set"));
 
+	let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap().to_lowercase();
 	let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap().to_lowercase();
 	let platform_format_lib = |a: &str| {
 		if target_os.contains("windows") { format!("{}.lib", a) } else { format!("lib{}.a", a) }
@@ -329,79 +330,101 @@ fn system_strategy() -> (PathBuf, bool) {
 		}
 	}
 
+	if cfg!(target_os = "macos") {
+		println!("cargo:rustc-link-lib=c++");
+		println!("cargo:rustc-link-lib=framework=Foundation");
+	} else if cfg!(target_os = "linux") {
+		println!("cargo:rustc-link-lib=stdc++");
+	}
+
+	add_search_dir(&lib_dir);
+
 	let mut needs_link = true;
-	if lib_dir.join(&profile).join(platform_format_lib("onnxruntime_common")).exists() {
-		add_search_dir(&lib_dir);
-		add_search_dir(&lib_dir.join(&profile));
-
-		if cfg!(target_os = "macos") {
-			println!("cargo:rustc-link-lib=c++");
-		} else if cfg!(target_os = "linux") {
-			println!("cargo:rustc-link-lib=stdc++");
-		}
-
-		for lib in &["common", "flatbuffers", "framework", "graph", "mlas", "optimizer", "providers", "session", "util"] {
-			let lib_path = lib_dir.join(&profile).join(platform_format_lib(&format!("onnxruntime_{lib}")));
-			// sanity check, just make sure the library exists before we try to link to it
-			if lib_path.exists() {
-				println!("cargo:rustc-link-lib=static=onnxruntime_{lib}");
-			} else {
-				panic!("[ort] unable to find ONNX Runtime library: {}", lib_path.display());
-			}
-		}
-
-		let external_lib_dir = lib_dir.join("_deps");
-
-		let protobuf_build = external_lib_dir.join("protobuf-build").join(&profile);
-		add_search_dir(&protobuf_build);
-		for lib in ["protobuf-lited", "protobuf-lite", "protobuf"] {
-			if target_os.contains("windows") && protobuf_build.join(platform_format_lib(&format!("lib{lib}"))).exists() {
-				println!("cargo:rustc-link-lib=static=lib{lib}")
-			} else if protobuf_build.join(platform_format_lib(lib)).exists() {
-				println!("cargo:rustc-link-lib=static={lib}");
-			}
-		}
-
-		add_search_dir(external_lib_dir.join("onnx-build").join(&profile));
-		println!("cargo:rustc-link-lib=static=onnx");
-		println!("cargo:rustc-link-lib=static=onnx_proto");
-
-		// println!("cargo:rustc-link-search=native={}", external_lib_dir.join("google_nsync-build").display());
-		// println!("cargo:rustc-link-lib=static=nsync_cpp");
-
-		add_search_dir(external_lib_dir.join("pytorch_cpuinfo-build").join(&profile));
-		add_search_dir(external_lib_dir.join("pytorch_cpuinfo-build").join("deps").join("clog").join(&profile));
-		println!("cargo:rustc-link-lib=static=cpuinfo");
-		println!("cargo:rustc-link-lib=static=clog");
-
-		add_search_dir(external_lib_dir.join("re2-build").join(&profile));
-		println!("cargo:rustc-link-lib=static=re2");
-
-		add_search_dir(external_lib_dir.join("abseil_cpp-build").join("absl").join("base").join(&profile));
-		println!("cargo:rustc-link-lib=static=absl_base");
-		println!("cargo:rustc-link-lib=static=absl_throw_delegate");
-		add_search_dir(external_lib_dir.join("abseil_cpp-build").join("absl").join("hash").join(&profile));
-		println!("cargo:rustc-link-lib=static=absl_hash");
-		println!("cargo:rustc-link-lib=static=absl_city");
-		println!("cargo:rustc-link-lib=static=absl_low_level_hash");
-		add_search_dir(external_lib_dir.join("abseil_cpp-build").join("absl").join("container").join(&profile));
-		println!("cargo:rustc-link-lib=static=absl_raw_hash_set");
-
-		if cfg!(target_os = "macos") {
-			println!("cargo:rustc-link-lib=framework=Foundation");
-		}
-
-		// #[cfg(feature = "rocm")]
-		// println!("cargo:rustc-link-lib=onnxruntime_providers_rocm");
-
+	if lib_dir.join(platform_format_lib("onnxruntime")).exists() {
+		println!("cargo:rustc-link-lib=static=onnxruntime");
 		needs_link = false;
 	} else {
-		#[cfg(feature = "copy-dylibs")]
-		{
-			if lib_dir.join("lib").is_dir() {
-				copy_libraries(&lib_dir.join("lib"), &PathBuf::from(env::var("OUT_DIR").unwrap()));
-			} else if lib_dir.join(&profile).is_dir() {
-				copy_libraries(&lib_dir.join(profile), &PathBuf::from(env::var("OUT_DIR").unwrap()));
+		let static_configs: Vec<(PathBuf, PathBuf, Box<dyn Fn(PathBuf, &String) -> PathBuf>)> = vec![
+			(lib_dir.join(&profile), lib_dir.join("_deps"), Box::new(|p: PathBuf, profile| p.join(profile))),
+			(lib_dir.clone(), lib_dir.parent().unwrap().join("_deps"), Box::new(|p: PathBuf, _| p)),
+			(lib_dir.join("onnxruntime"), lib_dir.join("_deps"), Box::new(|p: PathBuf, _| p)),
+		];
+		for (lib_dir, external_lib_dir, transform_dep) in static_configs {
+			if lib_dir.join(platform_format_lib("onnxruntime_common")).exists() {
+				add_search_dir(&lib_dir);
+
+				for lib in &["common", "flatbuffers", "framework", "graph", "mlas", "optimizer", "providers", "session", "util"] {
+					let lib_path = lib_dir.join(platform_format_lib(&format!("onnxruntime_{lib}")));
+					// sanity check, just make sure the library exists before we try to link to it
+					if lib_path.exists() {
+						println!("cargo:rustc-link-lib=static=onnxruntime_{lib}");
+					} else {
+						panic!("[ort] unable to find ONNX Runtime library: {}", lib_path.display());
+					}
+				}
+
+				if target_arch == "wasm32" {
+					for lib in &["webassembly", "providers_js"] {
+						let lib_path = lib_dir.join(platform_format_lib(&format!("onnxruntime_{lib}")));
+						if lib_path.exists() {
+							println!("cargo:rustc-link-lib=static=onnxruntime_{lib}");
+						}
+					}
+				}
+
+				let protobuf_build = transform_dep(external_lib_dir.join("protobuf-build"), &profile);
+				add_search_dir(&protobuf_build);
+				for lib in ["protobuf-lited", "protobuf-lite", "protobuf"] {
+					if target_os.contains("windows") && protobuf_build.join(platform_format_lib(&format!("lib{lib}"))).exists() {
+						println!("cargo:rustc-link-lib=static=lib{lib}")
+					} else if protobuf_build.join(platform_format_lib(lib)).exists() {
+						println!("cargo:rustc-link-lib=static={lib}");
+					}
+				}
+
+				add_search_dir(transform_dep(external_lib_dir.join("onnx-build"), &profile));
+				println!("cargo:rustc-link-lib=static=onnx");
+				println!("cargo:rustc-link-lib=static=onnx_proto");
+
+				add_search_dir(transform_dep(external_lib_dir.join("google_nsync-build"), &profile));
+				println!("cargo:rustc-link-lib=static=nsync_cpp");
+
+				if target_arch != "wasm32" {
+					add_search_dir(transform_dep(external_lib_dir.join("pytorch_cpuinfo-build"), &profile));
+					add_search_dir(transform_dep(external_lib_dir.join("pytorch_cpuinfo-build").join("deps").join("clog"), &profile));
+					println!("cargo:rustc-link-lib=static=cpuinfo");
+					println!("cargo:rustc-link-lib=static=clog");
+				}
+
+				add_search_dir(transform_dep(external_lib_dir.join("re2-build"), &profile));
+				println!("cargo:rustc-link-lib=static=re2");
+
+				add_search_dir(transform_dep(external_lib_dir.join("abseil_cpp-build").join("absl").join("base"), &profile));
+				println!("cargo:rustc-link-lib=static=absl_base");
+				println!("cargo:rustc-link-lib=static=absl_throw_delegate");
+				add_search_dir(transform_dep(external_lib_dir.join("abseil_cpp-build").join("absl").join("hash"), &profile));
+				println!("cargo:rustc-link-lib=static=absl_hash");
+				println!("cargo:rustc-link-lib=static=absl_city");
+				println!("cargo:rustc-link-lib=static=absl_low_level_hash");
+				add_search_dir(transform_dep(external_lib_dir.join("abseil_cpp-build").join("absl").join("container"), &profile));
+				println!("cargo:rustc-link-lib=static=absl_raw_hash_set");
+
+				// #[cfg(feature = "rocm")]
+				// println!("cargo:rustc-link-lib=onnxruntime_providers_rocm");
+
+				needs_link = false;
+				break;
+			}
+		}
+		if needs_link {
+			// none of the static link patterns matched, we might be trying to dynamic link so copy dylibs if requested
+			#[cfg(feature = "copy-dylibs")]
+			{
+				if lib_dir.join("lib").is_dir() {
+					copy_libraries(&lib_dir.join("lib"), &PathBuf::from(env::var("OUT_DIR").unwrap()));
+				} else if lib_dir.join(&profile).is_dir() {
+					copy_libraries(&lib_dir.join(profile), &PathBuf::from(env::var("OUT_DIR").unwrap()));
+				}
 			}
 		}
 	}
@@ -640,43 +663,6 @@ fn prepare_libort_dir() -> (PathBuf, bool) {
 	}
 }
 
-#[cfg(feature = "generate-bindings")]
-fn generate_bindings(include_dir: &Path) {
-	let clang_args = &[
-		format!("-I{}", include_dir.display()),
-		format!("-I{}", include_dir.join("onnxruntime").join("core").join("session").display())
-	];
-
-	println!("cargo:rerun-if-changed=src/wrapper.h");
-
-	let bindings = bindgen::Builder::default()
-        .header("src/wrapper.h")
-		.allowlist_var("Ort.+|ORT.+")
-		.allowlist_function("Ort.+")
-		.allowlist_type("Ort.+")
-        .clang_args(clang_args)
-        // Tell cargo to invalidate the built crate whenever any of the included header files changed.
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
-        // Set `size_t` to be translated to `usize` for win32 compatibility.
-        .size_t_is_usize(env::var("CARGO_CFG_TARGET_ARCH").unwrap().contains("x86"))
-        // Format using rustfmt
-        .rustfmt_bindings(true)
-        .rustified_enum("*")
-        .generate()
-        .expect("Unable to generate bindings");
-
-	// Write the bindings to (source controlled) src/onnx/bindings/<os>/<arch>/bindings.rs
-	let generated_file = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
-		.join("src")
-		.join("bindings")
-		.join(env::var("CARGO_CFG_TARGET_OS").unwrap())
-		.join(env::var("CARGO_CFG_TARGET_ARCH").unwrap())
-		.join("bindings.rs");
-	println!("cargo:rerun-if-changed={generated_file:?}");
-	fs::create_dir_all(generated_file.parent().unwrap()).unwrap();
-	bindings.write_to_file(&generated_file).expect("Couldn't write bindings!");
-}
-
 fn real_main(link: bool) {
 	let (install_dir, needs_link) = prepare_libort_dir();
 
@@ -696,9 +682,6 @@ fn real_main(link: bool) {
 	}
 
 	println!("cargo:rerun-if-env-changed={}", ORT_ENV_STRATEGY);
-
-	#[cfg(feature = "generate-bindings")]
-	generate_bindings(&include_dir);
 }
 
 fn main() {
